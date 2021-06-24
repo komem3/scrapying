@@ -11,19 +11,67 @@ import (
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/datastore"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/go-chi/chi/v5"
 	"github.com/hashicorp/logutils"
-	"golang.org/x/sync/errgroup"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"golang.org/x/xerrors"
 )
 
-func main() {
+var (
+	discordURL string
+	mediumURL  string
+	level      string
+	port       string
+	projectID  string
+)
+
+func init() {
+	pflag.StringP("medium", "m", "", "target meduim url")
+	pflag.StringP("discord", "d", "", "discord webhook url")
+	pflag.StringP("level", "v", "INFO", "output verbose level")
+	pflag.StringP("port", "P", "8080", "bind port")
+	pflag.String("project", "test-project", "project id")
+
+	pflag.Parse()
+	viper.BindPFlags(pflag.CommandLine)
+
+	viper.BindEnv("discord")
+	viper.BindEnv("medium")
+	viper.BindEnv("level")
+	viper.BindEnv("port")
+
+	if metadata.OnGCE() {
+		p, err := metadata.ProjectID()
+		if err != nil {
+			log.Fatalf("[ERROR] project id is missing: %v", err)
+		}
+		projectID = p
+	}
+
+	discordURL = viper.GetString("discord")
+	if discordURL == "" {
+		pflag.PrintDefaults()
+		log.Fatal("[ERROR] discord is required.")
+	}
+	mediumURL = viper.GetString("medium")
+	if mediumURL == "" {
+		pflag.PrintDefaults()
+		log.Fatal("[ERROR] meduim is required.")
+	}
+	level = viper.GetString("level")
+	port = viper.GetString("port")
 	filter := &logutils.LevelFilter{
 		Levels:   []logutils.LogLevel{"DEBUG", "INFO", "WARN", "ERROR"},
-		MinLevel: logutils.LogLevel("INFO"),
+		MinLevel: logutils.LogLevel(level),
 		Writer:   os.Stderr,
 	}
 	log.SetOutput(filter)
+}
 
+func main() {
+	log.Printf("[DEBUG] discordURL is '%s'", discordURL)
+	log.Printf("[DEBUG] mediumURL is '%s'", mediumURL)
 	ctx := context.Background()
 
 	if !metadata.OnGCE() {
@@ -34,50 +82,22 @@ func main() {
 		defer end()
 	}
 
-	client, err := datastore.NewClient(ctx, "")
+	client, err := datastore.NewClient(ctx, projectID)
 	if err != nil {
 		log.Printf("[ERROR] %v", err)
 		return
 	}
 	dsClient = client
 
-	doc, err := fetchHTML(ctx, os.Args[1])
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("[DEBUG] document: %#v\n", doc)
+	r := chi.NewRouter()
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		if err := scrayping(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
 
-	links := getLinks(doc)
-	eg, ctx := errgroup.WithContext(ctx)
-	for _, link := range links {
-		link := link
-		eg.Go(func() error {
-			imageDoc, err := fetchHTML(ctx, link)
-			if err != nil {
-				return err
-			}
-			img := getImage(imageDoc)
-			log.Printf("[INFO] image: %s\n", img)
-
-			comic := NewCommic(img)
-			_, err = GetComic(ctx, comic.ID)
-			if xerrors.Is(err, datastore.ErrNoSuchEntity) {
-				err = SaveComic(ctx, comic)
-				if err != nil {
-					return err
-				}
-				// TODO: discord に web hook してあげる
-			}
-			if err != nil {
-				return err
-			}
-			return nil
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		log.Fatal(err)
-	}
+	log.Printf("bind port: %s", port)
+	http.ListenAndServe(":"+port, r)
 }
 
 func getImage(doc *goquery.Document) string {
